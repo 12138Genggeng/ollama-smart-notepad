@@ -1,0 +1,16 @@
+# PyCharm配置
+.idea/
+*.iml
+
+# Python缓存
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 虚拟环境
+venv/
+env/
+
+# 日志、临时文件
+*.log
