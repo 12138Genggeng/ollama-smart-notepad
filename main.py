@@ -1,53 +1,80 @@
+"""
+AI智能记事本 - 本地RAG应用
+项目简介：基于Python + Ollama + Chroma向量数据库实现轻量化RAG笔记系统
+功能：笔记增删改查、关键词检索、AI总结笔记、基于笔记语义检索问答
+技术栈：
+    Python、requests(Ollama HTTP接口)、ChromaDB向量库、Ollama(Qwen2.5大模型 + nomic-embed-text向量嵌入模型)
+持久化：笔记原始文本保存到notes.json，文本向量存入Chroma持久化向量数据库
+运行前提：本地Ollama已启动，提前拉取 qwen2.5:7b-instruct 和 nomic-embed-text 模型
+"""
 import requests     # 用于发送HTTP请求，调用Ollama本地API
 import json         # 处理json读写，笔记持久化存储
 import os           # 文件系统操作，用来判断笔记文件是否存在
-import chromadb     # 向量数据库
+import chromadb     # 向量数据库，存储文本向量，实现语义检索
 from chromadb.config import Settings
 
 # ==================== 配置区域，根据你的Ollama环境修改 ====================
-OLLAMA_URL = "http://localhost:11434/api/generate"          # Ollama对话接口
-OLLAMA_EMBED_URL = "http://localhost:11434/api/embed"       # Ollama向量接口
-MODEL_NAME = "qwen2.5:7b-instruct"                          # 对话模型
-EMBED_MODEL = "nomic-embed-text"                            # embedding模型
-NOTE_FILE = "notes.json"                                    # 笔记JSON文件
-CHROMA_DIR = "./chroma_db"                                  # 向量库目录
-TOP_K = 3                                                   # RAG检索取最相关的几条
+OLLAMA_URL = "http://localhost:11434/api/generate"          # Ollama对话生成接口地址
+OLLAMA_EMBED_URL = "http://localhost:11434/api/embed"       # Ollama文本向量化接口地址
+MODEL_NAME = "qwen2.5:7b-instruct"                          # 用于问答、总结的大模型
+EMBED_MODEL = "nomic-embed-text"                            # 文本转向量的嵌入模型
+NOTE_FILE = "notes.json"                                    # 保存原始笔记的json文件名
+CHROMA_DIR = "./chroma_db"                                  # Chroma向量数据库存放文件夹
+TOP_K = 3                                                   # RAG检索时，取出相似度最高的3条笔记
 
-# 初始化Chroma向量库
+# 创建一个持久化的 Chroma 向量库客户端，向量数据保存在`CHROMA_DIR`这个本地文件夹
 chroma_client = chromadb.PersistentClient(
     path=CHROMA_DIR,
-    settings=Settings(anonymized_telemetry=False)
+    settings=Settings(anonymized_telemetry=False)  # 关闭遥感上报
+
 )
+# 获取/创建名为notes的向量集合，存放笔记向量
 collection = chroma_client.get_or_create_collection(name="notes")
 
 
 def load_notes():
-    """从本地json加载笔记"""
+    """
+    从本地json文件加载所有笔记
+    return: list 笔记列表，每一条笔记是字典 {id, content}
+    """
     if os.path.exists(NOTE_FILE):
         with open(NOTE_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
+    # 文件不存在，返回空笔记列表
     return []
 
 
 def save_notes(notes):
-    """保存笔记到json"""
+    """
+    将笔记列表写入本地json文件持久保存
+    :param notes: list 笔记列表
+    """
     with open(NOTE_FILE, "w", encoding="utf-8") as f:
+        # ensure_ascii=False 支持中文，indent=2格式化json方便阅读
         json.dump(notes, f, ensure_ascii=False, indent=2)
 
 
 def get_embedding(text: str) -> list:
-    """调用Ollama把文本转成向量"""
+    """
+    调用Ollama的embed接口，把一段文本转换成向量（embedding）
+    :param text: 输入的笔记文本/用户提问文本
+    :return: list 文本对应的向量数组
+    """
     resp = requests.post(
         OLLAMA_EMBED_URL,
         json={"model": EMBED_MODEL, "input": text},
         timeout=60
     )
-    resp.raise_for_status()
+    resp.raise_for_status()  # 请求异常直接抛出错误
     return resp.json()["embeddings"][0]
 
 
 def ai_ask(prompt: str) -> str:
-    """调用Ollama对话接口"""
+    """
+    调用Ollama大模型对话接口，传入prompt获取大模型返回文本
+    :param prompt: 提示词（包含用户问题+参考笔记上下文）
+    :return: 大模型回答字符串，出错返回错误信息
+    """
     payload = {"model": MODEL_NAME, "prompt": prompt, "stream": False}
     try:
         resp = requests.post(OLLAMA_URL, json=payload, timeout=120)
@@ -58,7 +85,11 @@ def ai_ask(prompt: str) -> str:
 
 
 def sync_old_notes_to_chroma():
-    """启动时：如果向量库空但notes.json有旧笔记，自动导入向量库"""
+    """
+    程序启动自动执行：
+    如果向量库是空，但是notes.json里面存在旧笔记，自动把历史笔记导入向量数据库
+    解决：之前保存过笔记，重启程序后向量库丢失的问题
+    """
     notes = load_notes()
     if collection.count() == 0 and notes:
         print(f"📥 检测到 {len(notes)} 条历史笔记，正在导入向量库...")
@@ -70,11 +101,15 @@ def sync_old_notes_to_chroma():
 
 
 def add_note(notes):
-    """新增笔记：同时写JSON和向量库"""
+    """
+    新增笔记：写入JSON保存原始文本，同时向Chroma向量库添加向量
+    :param notes: 内存中的笔记列表
+    """
     content = input("\n请输入笔记内容：")
     note_id = len(notes) + 1
     notes.append({"id": note_id, "content": content})
     save_notes(notes)
+    # 同步添加到向量数据库
     collection.add(
         ids=[str(note_id)],
         documents=[content],
@@ -84,7 +119,7 @@ def add_note(notes):
 
 
 def show_all_notes(notes):
-    """查看全部笔记"""
+    """查看内存中全部笔记"""
     if not notes:
         print("\n📒 暂无笔记")
         return
@@ -95,7 +130,7 @@ def show_all_notes(notes):
 
 
 def search_note(notes):
-    """关键词搜索"""
+    """简单关键词检索：字符串包含匹配（不是语义检索，是普通文本查找）"""
     keyword = input("\n输入搜索关键词：")
     result = [n for n in notes if keyword in n["content"]]
     if not result:
@@ -108,7 +143,10 @@ def search_note(notes):
 
 
 def edit_note(notes):
-    """修改笔记：同步更新向量库"""
+    """
+    修改笔记：修改JSON内笔记内容，同步更新向量库里面对应的向量
+    :param notes: 内存笔记列表
+    """
     if not notes:
         print("\n📒 暂无笔记，无法修改！")
         return
@@ -129,6 +167,7 @@ def edit_note(notes):
     new_content = input("请输入新的笔记内容：")
     target["content"] = new_content
     save_notes(notes)
+    # 更新向量库中这条笔记对应的向量
     collection.update(
         ids=[str(edit_id)],
         documents=[new_content],
@@ -138,7 +177,11 @@ def edit_note(notes):
 
 
 def delete_note(notes):
-    """删除笔记：同步删向量库，并重排ID"""
+    """
+    删除笔记：JSON删除笔记，向量库删除对应向量；删除后重新排序所有笔记ID
+    实现方案：删除后直接全量重建向量库，适合笔记数量不多的小型项目，逻辑简单不易出错
+    :param notes: 内存笔记列表
+    """
     if not notes:
         print("\n📒 暂无笔记，无法删除！")
         return
@@ -155,11 +198,14 @@ def delete_note(notes):
     if target_index is None:
         print("❌ 没有找到这个ID的笔记")
         return
+    # 内存列表删除这条笔记
     notes.pop(target_index)
+    # 删除后，重新编排所有笔记ID，保证ID连续
     for new_idx, note in enumerate(notes):
         note["id"] = new_idx + 1
     save_notes(notes)
-    # 向量库全量重建（数据量小，简单可靠）
+
+    # 全量重建向量库：清空向量库，把剩下笔记全部重新向量化存入
     existing = collection.get()["ids"]
     if existing:
         collection.delete(ids=existing)
@@ -172,7 +218,7 @@ def delete_note(notes):
 
 
 def ai_summary_notes(notes):
-    """AI总结全部笔记"""
+    """调用大模型，一次性总结全部笔记内容"""
     if not notes:
         print("暂无笔记可以总结！")
         return
@@ -184,14 +230,19 @@ def ai_summary_notes(notes):
 
 
 def ai_chat_with_notes(notes):
-    """【真RAG】向量检索 + 大模型回答"""
+    """
+    ✅ RAG核心函数：基于笔记做语义检索问答
+    流程：用户问题转向量 → 在向量库检索相似度最高笔记 → 把检索出来的笔记作为上下文交给大模型 → 大模型基于参考资料回答
+    """
     if not notes:
         print("请先添加笔记！")
         return
     question = input("\n输入你针对笔记想问AI的问题：")
     print("🔍 正在检索相关笔记...")
 
+    # 将用户提问转为向量
     q_emb = get_embedding(question)
+    # 在向量库查询TOP_K最相似笔记
     results = collection.query(
         query_embeddings=[q_emb],
         n_results=min(TOP_K, len(notes))
@@ -202,7 +253,9 @@ def ai_chat_with_notes(notes):
     for i, doc in enumerate(retrieved):
         print(f"  - {doc[:30]}...")
 
+    # 拼接检索出来的笔记作为上下文
     context = "\n".join([f"笔记{i+1}: {doc}" for i, doc in enumerate(retrieved)])
+    # 构造提示词，约束大模型：只能参考笔记内容，禁止编造
     prompt = (
         f"参考下面笔记内容回答用户问题，不要编造信息；"
         f"如果笔记里没有相关内容，就回答'笔记中未提及相关信息'。\n"
@@ -214,8 +267,12 @@ def ai_chat_with_notes(notes):
 
 
 def menu():
+    """程序主菜单入口，循环控制台交互"""
+    # 加载本地笔记
     notes = load_notes()
+    # 启动自动同步历史笔记到向量库
     sync_old_notes_to_chroma()
+    # 循环菜单
     while True:
         print("\n======== 智能记事本（本地Ollama + RAG版）========")
         print("1. 新增笔记")
@@ -249,5 +306,6 @@ def menu():
             print("❌ 输入错误，请重新选择！")
 
 
+# 程序入口，运行菜单
 if __name__ == "__main__":
     menu()
