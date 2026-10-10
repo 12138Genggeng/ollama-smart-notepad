@@ -1,3 +1,7 @@
+"""
+早期对照版：只有 JSON + 全量笔记塞进 Prompt，没有 Chroma、没有 Embedding。
+正式 RAG 入口请运行 main.py。本文件保留，方便对比「无检索」和「向量检索」的差异。
+"""
 import requests     # 用于发送HTTP请求，调用Ollama本地API
 import json         # 处理json读写，笔记持久化存储
 import os           # 文件系统操作，用来判断笔记文件是否存在
