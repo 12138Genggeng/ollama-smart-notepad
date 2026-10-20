@@ -20,6 +20,7 @@ env/
 # 运行时数据（笔记原文与向量库，勿提交个人数据）
 notes.json
 chroma_db/
+ocr_pages/
 
 # 日志
 *.log

@@ -8,6 +8,8 @@ AI 智能记事本（本地 RAG 版）
 
 数据流（写入）：
     用户输入 → JSON 原文 → 文本分片 → Ollama Embedding → Chroma 向量库
+数据流（PDF）：
+    PDF → PyMuPDF(dpi=300) → RapidOCR 原始文本 → Ollama 修复 → JSON 双文本 → 切块入库
 数据流（问答）：
     用户提问 → Embedding → Chroma 相似度检索 → 拼上下文 → LLM 输出
 """
@@ -16,6 +18,11 @@ import os
 import requests
 import chromadb
 from chromadb.config import Settings
+
+from errors import OcrFailedError, OllamaTimeoutError, PdfDamagedError
+from external_api import notify_external_sync
+from ocr_pipeline import PDF_RENDER_DPI, extract_ocr_text_from_pdf
+from ocr_repair import repair_ocr_text
 
 # ==================== 按本机 Ollama 环境修改 ====================
 OLLAMA_BASE = "http://localhost:11434"
@@ -93,28 +100,57 @@ def get_embedding(text: str) -> list:
     text = (text or "").strip()
     if not text:
         raise ValueError("不能对空文本做 Embedding")
-    resp = requests.post(
-        OLLAMA_EMBED_URL,
-        json={"model": EMBED_MODEL, "input": text},
-        timeout=60,
-    )
-    resp.raise_for_status()
-    data = resp.json()
+    try:
+        resp = requests.post(
+            OLLAMA_EMBED_URL,
+            json={"model": EMBED_MODEL, "input": text},
+            timeout=60,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except requests.exceptions.Timeout as e:
+        raise OllamaTimeoutError("Embedding 调用超时，请确认 nomic-embed-text 已拉取且 Ollama 空闲") from e
+    except requests.exceptions.ConnectionError as e:
+        raise OllamaTimeoutError("Embedding 连不上 Ollama（端口 11434）") from e
     embeddings = data.get("embeddings")
     if not embeddings:
         raise RuntimeError(f"Embedding 返回为空：{data}")
     return embeddings[0]
 
 
-def ai_ask(prompt: str) -> str:
-    """调用本地大模型生成回答（非流式）。"""
+def ai_ask_or_raise(prompt: str, timeout: int = 180) -> str:
+    """
+    调用本地大模型；超时、断连、HTTP 错误一律抛异常。
+    OCR 修复必须走这条，才能把「超时」和「模型胡编」区分开。
+    """
     payload = {"model": MODEL_NAME, "prompt": prompt, "stream": False}
     try:
-        resp = requests.post(OLLAMA_URL, json=payload, timeout=180)
+        resp = requests.post(OLLAMA_URL, json=payload, timeout=timeout)
         resp.raise_for_status()
-        return resp.json().get("response", "")
-    except requests.exceptions.ConnectionError:
-        return "AI 调用失败：连不上 Ollama，请确认服务已启动（默认端口 11434）。"
+        text = (resp.json().get("response") or "").strip()
+        if not text:
+            raise RuntimeError("大模型返回空内容")
+        return text
+    except requests.exceptions.Timeout as e:
+        raise OllamaTimeoutError(
+            f"大模型调用超时（>{timeout}s）。可换小模型或缩短 OCR 文本后重试。"
+        ) from e
+    except requests.exceptions.ConnectionError as e:
+        raise OllamaTimeoutError(
+            "连不上 Ollama，请确认服务已启动（默认端口 11434）。"
+        ) from e
+    except OllamaTimeoutError:
+        raise
+    except Exception as e:
+        raise OllamaTimeoutError(f"大模型调用失败：{e}") from e
+
+
+def ai_ask(prompt: str) -> str:
+    """问答/总结用：失败时返回可读字符串，不中断菜单。"""
+    try:
+        return ai_ask_or_raise(prompt)
+    except OllamaTimeoutError as e:
+        return f"AI 调用失败：{e}"
     except Exception as e:
         return f"AI 调用失败：{e}"
 
@@ -178,7 +214,8 @@ def rebuild_chroma_from_json(notes):
     print("🔄 正在按 notes.json 全量重建向量库...")
     clear_collection()
     for note in notes:
-        upsert_note_vectors(int(note["id"]), note["content"])
+        # PDF 笔记的 content 就是 AI 修复后的文本，与手工笔记同一套入库
+        upsert_note_vectors(int(note["id"]), note.get("content") or "")
     print(f"✅ 向量库已重建，共 {len(notes)} 条笔记、{collection.count()} 个分片")
 
 
@@ -222,8 +259,10 @@ def add_note(notes):
     except Exception as e:
         print(f"❌ 向量写入失败，笔记未保存：{e}")
         return
-    notes.append({"id": note_id, "content": content})
+    record = {"id": note_id, "content": content, "source": "manual"}
+    notes.append(record)
     save_notes(notes)
+    notify_external_sync(record)
     print("✅ 笔记保存成功（JSON + 向量库已同步）")
 
 
@@ -233,14 +272,24 @@ def show_all_notes(notes):
         return
     print("\n===== 全部笔记 =====")
     for note in notes:
-        print(f"\nID:{note['id']}")
-        print(f"内容：{note['content']}")
+        print(f"\nID:{note['id']}  来源：{note.get('source', 'manual')}")
+        print(f"内容（RAG 使用）：{note['content']}")
+        if note.get("ocr_raw"):
+            print("---- OCR原始文本 ----")
+            print(note["ocr_raw"])
+            print("---- AI修复后的文本 ----")
+            print(note.get("ocr_repaired") or note["content"])
 
 
 def search_note(notes):
     """关键词包含匹配（不是语义检索）。语义问答请走菜单 5。"""
     keyword = input("\n输入搜索关键词：")
-    result = [n for n in notes if keyword in n["content"]]
+    result = [
+        n for n in notes
+        if keyword in (n.get("content") or "")
+        or keyword in (n.get("ocr_raw") or "")
+        or keyword in (n.get("ocr_repaired") or "")
+    ]
     if not result:
         print("未找到匹配笔记")
         return
@@ -281,7 +330,10 @@ def edit_note(notes):
         print(f"❌ 向量更新失败，原文未改动：{e}")
         return
     target["content"] = new_content
+    if target.get("ocr_repaired") is not None:
+        target["ocr_repaired"] = new_content
     save_notes(notes)
+    notify_external_sync(target)
     print("✅ 笔记修改成功（JSON + 向量库已同步）")
 
 
@@ -373,6 +425,71 @@ def ai_chat_with_notes(notes):
     print(ai_ask(prompt))
 
 
+def import_pdf_note(notes):
+    """
+    菜单入口：PDF 上传 → OCR 原始文本 → AI 修复 → 双文本入 JSON → 修复文本切块入库。
+    任一步失败都不写 JSON，避免「半截笔记」污染向量库。
+    """
+    pdf_path = input("\n请输入 PDF 文件路径：").strip().strip('"')
+    if not pdf_path:
+        print("❌ 路径不能为空")
+        return
+    print(f"📥 开始解析 PDF（dpi={PDF_RENDER_DPI}）...")
+    try:
+        ocr_raw = extract_ocr_text_from_pdf(pdf_path, dpi=PDF_RENDER_DPI)
+    except FileNotFoundError as e:
+        print(f"❌ {e}")
+        return
+    except PdfDamagedError as e:
+        print(f"❌ 文件损坏或无法解析：{e}")
+        return
+    except OcrFailedError as e:
+        print(f"❌ OCR 识别失败：{e}")
+        return
+    except Exception as e:
+        print(f"❌ PDF/OCR 未知错误：{e}")
+        return
+
+    print("\n==== OCR原始文本 ====")
+    print(ocr_raw)
+    print("\n🤖 正在调用本地大模型修复 OCR 文本，请等待...")
+    try:
+        ocr_repaired = repair_ocr_text(ocr_raw, ai_ask_or_raise)
+    except OllamaTimeoutError as e:
+        print(f"❌ 大模型调用超时/失败，未入库：{e}")
+        return
+    except Exception as e:
+        print(f"❌ OCR 文本修复失败，未入库：{e}")
+        return
+
+    print("\n==== AI修复后的文本 ====")
+    print(ocr_repaired)
+
+    note_id = next_note_id(notes)
+    try:
+        # 知识库只索引修复后的文本，复用现有分片 + Embedding + Chroma 逻辑
+        upsert_note_vectors(note_id, ocr_repaired)
+    except OllamaTimeoutError as e:
+        print(f"❌ Embedding/大模型超时，未入库：{e}")
+        return
+    except Exception as e:
+        print(f"❌ 向量写入失败，笔记未保存：{e}")
+        return
+
+    record = {
+        "id": note_id,
+        "content": ocr_repaired,
+        "ocr_raw": ocr_raw,
+        "ocr_repaired": ocr_repaired,
+        "source": "pdf_ocr",
+        "source_file": os.path.basename(pdf_path),
+    }
+    notes.append(record)
+    save_notes(notes)
+    notify_external_sync(record)
+    print("✅ PDF 笔记已保存：JSON 含【OCR原始文本】+【AI修复后的文本】，向量库仅索引修复文本")
+
+
 def menu():
     notes = load_notes()
     check_ollama()
@@ -388,6 +505,7 @@ def menu():
         print("6. 修改笔记")
         print("7. 删除笔记")
         print("8. 重建向量库（JSON → Chroma 全量同步）")
+        print("9. 上传PDF（OCR + AI修复入库）")
         print("0. 退出程序")
         choice = input("\n请输入选项：").strip()
 
@@ -407,6 +525,8 @@ def menu():
             delete_note(notes)
         elif choice == "8":
             rebuild_chroma_from_json(notes)
+        elif choice == "9":
+            import_pdf_note(notes)
         elif choice == "0":
             print("👋 程序退出，笔记已保存")
             break

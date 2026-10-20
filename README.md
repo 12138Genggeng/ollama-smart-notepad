@@ -42,39 +42,50 @@ RAG问答演示截图
 
 ```
 pythonProject4/
-├── main.py                 # RAG 正式入口（增删改查 + 向量同步 + 语义问答）
-├── notepad_ai.py           # 早期对照版：无 Chroma，把全部笔记塞进 Prompt
-├── requirements.txt        # Python 依赖
-├── notes.json              # 运行后生成，笔记原文（已加入 .gitignore）
-├── chroma_db/              # 运行后生成，持久化向量库（已加入 .gitignore）
-├── assets/demo.jpg         # 运行界面截图
+├── main.py                 # RAG 正式入口（CRUD + PDF/OCR 入库 + 语义问答）
+├── ocr_pipeline.py         # PDF→dpi=300 图片→RapidOCR 原始文本
+├── ocr_repair.py           # Ollama 修复 OCR，产出 AI 修复文本
+├── external_api.py         # Notion / Obsidian 同步接口预留（未接真实 API）
+├── errors.py               # PDF 损坏、OCR 失败、大模型超时
+├── notepad_ai.py           # 早期对照版：无 Chroma
+├── requirements.txt        # 完整依赖清单
+├── notes.json              # 运行后生成（已 gitignore）
+├── chroma_db/              # 运行后生成（已 gitignore）
 └── README.md
 ```
 
 | 文件 | 作用 |
 |------|------|
-| `main.py` | 配置 Ollama 地址与模型；JSON CRUD；文本分片；Embedding；Chroma 同步；RAG 问答 |
-| `notepad_ai.py` | 第一阶段实现，用来对比「全量上下文」和「向量检索」 |
-| `requirements.txt` | `requests`（调 Ollama HTTP）+ `chromadb`（向量库） |
-| `notes.json` | 唯一原文源：`[{"id": 1, "content": "..."}]` |
-| `chroma_db/` | 分片向量；metadata 带 `note_id`，改/删笔记时按 ID 同步 |
+| `main.py` | 菜单、JSON CRUD、复用切块/Embedding/Chroma、PDF 入库编排 |
+| `ocr_pipeline.py` | PyMuPDF 渲染页面 + RapidOCR |
+| `ocr_repair.py` | 内置 OCR 修复提示词，调用本地大模型 |
+| `external_api.py` | `NoteSyncAdapter` / `NotionAdapter` / `ObsidianAdapter` 空实现 |
+| `errors.py` | `PdfDamagedError` / `OcrFailedError` / `OllamaTimeoutError` |
+| `notes.json` | 手工笔记：`content`；PDF 笔记额外保存 `ocr_raw` 与 `ocr_repaired` |
+| `chroma_db/` | 只索引 `content`（即修复后文本），供 RAG 检索 |
 
 ### 架构与数据流
 
 ```mermaid
 flowchart LR
-    U[用户输入] --> JSON[notes.json 原文]
-    JSON --> SPLIT[文本分片]
+    U[用户输入] --> JSON[notes.json]
+    PDF[PDF上传] --> IMG[PyMuPDF dpi=300]
+    IMG --> OCR[RapidOCR原始文本]
+    OCR --> FIX[Ollama修复]
+    FIX --> JSON
+    JSON --> SPLIT[文本分片 split_text]
     SPLIT --> EMB[Ollama Embedding<br/>nomic-embed-text]
     EMB --> CHROMA[Chroma 向量库]
     Q[用户提问] --> QEMB[问题 Embedding]
     QEMB --> CHROMA
     CHROMA --> RAG[RAG 取 Top-K 分片]
-    RAG --> LLM[Ollama LLM<br/>qwen2.5]
+    RAG --> LLM[Ollama LLM]
     LLM --> OUT[回答输出]
+    JSON -.-> API[Notion/Obsidian预留接口]
 ```
 
 写入路径：用户输入 → JSON → 分片 → Embedding → Chroma。  
+PDF 路径：PDF → 300dpi 图 → OCR 原始文本 → Ollama 修复 → JSON 双文本 → **复用** `split_text` / `upsert_note_vectors`。  
 问答路径：提问 → Embedding → Chroma 相似度检索 → 只把命中分片拼进 Prompt → LLM。
 
 ---
@@ -91,7 +102,21 @@ flowchart LR
 | 6 | 修改笔记 | 删旧分片 → 新分片 Embedding → 再改 JSON |
 | 7 | 删除笔记 | JSON 与 Chroma 按 `note_id` 一起删，不重排 ID |
 | 8 | 重建向量库 | 以 JSON 为真相源全量同步 |
+| 9 | 上传 PDF | RapidOCR + AI 修复；原始/修复文本都写入 JSON，向量库只收修复文本 |
 | 0 | 退出 | — |
+
+PDF 笔记在 `notes.json` 中的字段：
+
+```json
+{
+  "id": 1,
+  "content": "AI修复后的文本（RAG 检索用这个）",
+  "ocr_raw": "OCR原始文本",
+  "ocr_repaired": "AI修复后的文本",
+  "source": "pdf_ocr",
+  "source_file": "notes.pdf"
+}
+```
 
 ---
 
@@ -135,8 +160,10 @@ pip install -r requirements.txt
 等价于：
 
 ```powershell
-pip install requests chromadb
+pip install requests chromadb pymupdf numpy rapidocr-onnxruntime onnxruntime opencv-python-headless Pillow pyclipper shapely
 ```
+
+首次跑 RapidOCR 会加载本地 ONNX 模型，第一次识别可能较慢。
 
 ### 4. 启动
 
@@ -169,6 +196,8 @@ chcp 65001
 2. **手写 RAG**：不用 LangChain，直接 `requests` 调 `/api/embed` 和 `/api/generate`。
 3. **分片 Embedding**：长笔记切成带重叠的块，检索粒度是分片而不是整篇。
 4. **改删同步**：`upsert_note_vectors` 先删该 `note_id` 的旧分片再写入，避免检索到旧内容。
+5. **PDF/OCR**：300dpi 渲染后 RapidOCR；JSON 同时留存原始识别与 AI 修复结果；入库仍走原切块函数。
+6. **外部 API 预留**：`external_api.py` 里 Notion / Obsidian 适配器默认关闭，笔记保存后走 `notify_external_sync`。
 
 ---
 
